@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quản Lý Căn Hộ & Shophouse - One Center Land</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+  <!-- Firebase SDK Modules (Thêm Storage) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+    import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, updateDoc, onSnapshot, doc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+    import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-storage.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyCf3BXo66L_iPO0VwTulrwHFuhDqMFjHoQ",
+      authDomain: "one-center-land.firebaseapp.com",
+      projectId: "one-center-land",
+      storageBucket: "one-center-land.appspot.com", // Đã chuẩn hóa bucket lưu trữ
+      messagingSenderId: "293337057235",
+      appId: "1:293337057235:web:1b0b9c8bf8e26ca2199126",
+      measurementId: "G-8R9PRDRN2P"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const storage = getStorage(app);
+
+    let FB_ACCESS_TOKEN = localStorage.getItem("FB_ACCESS_TOKEN") || "";
+
+    let rawApartmentsData = []; 
+    let selectedImageFiles = []; 
+    let editingApartmentId = null;
+    let currentPostApt = null;
+    let cachedPagesList = [];
+
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        document.getElementById('loginSection').classList.add('hidden');
+        document.getElementById('appSection').classList.remove('hidden');
+        document.getElementById('userEmailDisplay').innerText = user.email;
+        loadApartmentsRealtime();
+      } else {
+        document.getElementById('loginSection').classList.remove('hidden');
+        document.getElementById('appSection').classList.add('hidden');
+      }
+    });
+
+    window.handleLogin = async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('loginEmail').value;
+      const pass = document.getElementById('loginPass').value;
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+      } catch (err) {
+        alert("Đăng nhập thất bại: " + err.message);
+      }
+    };
+
+    window.handleLogout = () => signOut(auth);
+
+    window.handleMultipleImages = (files) => {
+      if (!files || files.length === 0) return;
+      for (let file of Array.from(files)) {
+        selectedImageFiles.push(file);
+      }
+      renderImagePreviews();
+    };
+
+    window.removeImageAt = (index) => {
+      selectedImageFiles.splice(index, 1);
+      renderImagePreviews();
+    };
+
+    function renderImagePreviews() {
+      const container = document.getElementById('imagePreviewGrid');
+      container.innerHTML = "";
+      if (selectedImageFiles.length > 0) {
+        document.getElementById('previewContainer').classList.remove('hidden');
+      } else {
+        document.getElementById('previewContainer').classList.add('hidden');
+        document.getElementById('fileInput').value = "";
+      }
+      
+      selectedImageFiles.forEach((item, idx) => {
+        const imgSrc = (typeof item === 'string') ? item : URL.createObjectURL(item);
+        const imgCard = `
+          <div class="relative rounded-xl overflow-hidden border border-slate-200 shadow-sm bg-slate-100 aspect-video">
+            <img src="${imgSrc}" class="w-full h-full object-cover">
+            <button type="button" onclick="removeImageAt(${idx})" class="absolute top-1 right-1 bg-rose-600 text-white rounded-full w-6 h-6 text-xs flex items-center justify-center shadow">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+            <span class="absolute bottom-1 left-1 bg-slate-900/70 text-white text-[10px] px-1.5 py-0.5 rounded">Ảnh ${idx + 1}</span>
+          </div>
+        `;
+        container.innerHTML += imgCard;
+      });
+    }
+
+    // 🔄 THAY THẾ IMGBB BẰNG FIREBASE STORAGE
+    async function uploadSingleImageToFirebaseStorage(file) {
+      if (typeof file === 'string') return file; // Nếu đã là URL sẵn thì giữ nguyên
+      const fileName = `apartments/${Date.now()}_${file.name}`;
+      const storageRef = ref(storage, fileName);
+      
+      // Tiến hành tải lên Google Storage
+      const snapshot = await uploadBytes(storageRef, file);
+      const downloadURL = await getDownloadURL(snapshot.ref);
+      return downloadURL;
+    }
+
+    window.downloadAllImagesDirect = async (id) => {
+      const apt = rawApartmentsData.find(a => a.id === id);
+      if (!apt || !apt.images || apt.images.length === 0) {
+        alert("Bất động sản này chưa có ảnh!");
+        return;
+      }
+      const codeName = apt.codeNew || 'BDS';
+      for (let index = 0; index < apt.images.length; index++) {
+        const imgUrl = apt.images[index];
+        try {
+          const response = await fetch(imgUrl);
+          const blob = await response.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = blobUrl;
+          a.download = `${codeName}_Anh_${index + 1}.jpg`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        } catch (err) {
+          window.open(imgUrl, '_blank');
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+    };
+
+    window.copyCurrentImageLink = () => {
+      if (currentGalleryImages.length > 0) {
+        const url = currentGalleryImages[currentGalleryIndex];
+        navigator.clipboard.writeText(url).then(() => {
+          alert("📋 Đã copy link ảnh nét HD! Anh dán vào Zalo gửi khách ngay nhé!");
+        });
+      }
+    };
+
+    // 🤖 AI TẠO BÀI ĐĂNG GỐC
+    window.generateAIPost = (id) => {
+      const apt = rawApartmentsData.find(a => a.id === id);
+      if (!apt) return;
+      currentPostApt = apt;
+
+      let priceStr = "";
+      if (apt.priceSell) priceStr += `💰 Giá Bán: ${apt.priceSell} Tỷ (Thương lượng chính chủ)\n`;
+      if (apt.priceRent) priceStr += `🔑 Giá Thuê: ${apt.priceRent} Triệu/Tháng\n`;
+
+      let dealTypeHeader = "BÁN & CHO THUÊ BẤT ĐỘNG SẢN CAO CẤP";
+      if (apt.transactionType === "Bán") dealTypeHeader = "CHUYỂN NHƯỢNG BẤT ĐỘNG SẢN CAO CẤP";
+      if (apt.transactionType === "Cho thuê") dealTypeHeader = "CHO THUÊ BẤT ĐỘNG SẢN CAO CẤP";
+
+      const aiTemplate = `🔥 ${dealTypeHeader} - ${apt.projectName.toUpperCase()} 🔥
+
+📍 Vị trí: Khu đô thị đẳng cấp ${apt.projectName}
+
+✨ THÔNG TIN CHI TIẾT:
+• Loại hình: ${apt.unitType || 'Căn hộ / Shophouse'}
+• Diện tích: ${apt.area} m²
+• Quy mô: ${apt.unitType === 'Shophouse' ? 'Shophouse kinh doanh sầm uất' : ((apt.bedrooms || 1) + ' Phòng Ngủ | ' + (apt.bathrooms || 1) + ' WC')}
+• Hướng ban công/Cửa: ${apt.balconyDirection || 'Thoáng mát'}
+• Tình trạng: ${apt.status}
+
+${priceStr}
+📝 MÔ TẢ & TIỆN ÍCH:
+${apt.notes ? apt.notes : '• Thiết kế hiện đại, mặt tiền kinh doanh đắc địa hoặc không gian sống sang trọng\n• Tiện ích nội khu chuẩn 5 sao, an ninh khép kín 24/7\n• Tiềm năng khai thác kinh doanh và sinh lời vượt trội'}
+
+-----------------------------
+☎️ LIÊN HỆ XEM NHÀ THỰC TẾ 24/7:
+🏢 CÔNG TY TNHH BẤT ĐỘNG SẢN ONE CENTER LAND
+📞 Hotline/Zalo phòng kinh doanh dự án: 0979.669.663
+
+#OneCenterLand #${apt.projectName.replace(/\s+/g, '')} #BanBatDongSan #${apt.unitType ? apt.unitType.replace(/\s+/g, '') : 'CanHo'}`;
+
+      document.getElementById('fbPostContent').value = aiTemplate;
+      document.getElementById('fbAccessToken').value = FB_ACCESS_TOKEN;
+      
+      fetchRealFacebookDestinations(FB_ACCESS_TOKEN);
+      document.getElementById('fbModal').classList.remove('hidden');
+    };
+
+    // QUÉT DANH SÁCH FANPAGE QUẢN TRỊ
+    async function fetchRealFacebookDestinations(token) {
+      const container = document.getElementById('fbDestinationsContainer');
+      if (!token) {
+        container.innerHTML = `<p class="text-xs text-rose-600 font-bold p-2">⚠️ Anh chưa nhập Facebook Access Token ở bên dưới!</p>`;
+        return;
+      }
+
+      container.innerHTML = `<p class="text-xs text-blue-600 font-bold p-2 animate-pulse"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Đang kết nối Facebook quét danh sách Fanpage quản trị...</p>`;
+
+      try {
+        const resPages = await fetch(`https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`);
+        const dataPages = await resPages.json();
+
+        let htmlContent = "";
+        cachedPagesList = [];
+
+        if (dataPages.data && dataPages.data.length > 0) {
+          cachedPagesList = dataPages.data;
+          htmlContent += `<div class="col-span-full text-[11px] font-extrabold text-blue-900 uppercase tracking-wider bg-blue-100 px-2 py-1 rounded">⭐ Chọn các Fanpage muốn đăng hàng loạt:</div>`;
+          dataPages.data.forEach((page, idx) => {
+            const checked = idx === 0 ? "checked" : "";
+            htmlContent += `
+              <label class="flex items-center gap-2.5 p-2.5 bg-white border border-blue-200 rounded-xl cursor-pointer hover:bg-blue-50 transition shadow-sm">
+                <input type="checkbox" name="fbTargetDest" value="${page.id}" ${checked} class="w-4 h-4 text-blue-600 rounded">
+                <span class="text-xs font-bold text-slate-800 truncate">📄 ${page.name}</span>
+              </label>
+            `;
+          });
+          container.innerHTML = htmlContent;
+        } else {
+          container.innerHTML = `<p class="text-xs text-amber-700 font-bold p-2">⚠️ Không tìm thấy Fanpage nào do tài khoản này quản lý!</p>`;
+        }
+      } catch (err) {
+        container.innerHTML = `<p class="text-xs text-rose-600 font-bold p-2">❌ Lỗi kết nối Facebook API: ${err.message}</p>`;
+      }
+    }
+
+    window.closeFBModal = () => { document.getElementById('fbModal').classList.add('hidden'); };
+    
+    window.saveFBCredentials = () => {
+      FB_ACCESS_TOKEN = document.getElementById('fbAccessToken').value.trim();
+      localStorage.setItem("FB_ACCESS_TOKEN", FB_ACCESS_TOKEN);
+      alert("✅ Đã lưu mã Access Token thành công!");
+      fetchRealFacebookDestinations(FB_ACCESS_TOKEN);
+    };
+
+    function generateSpunContent(baseContent, index) {
+      const variations = [
+        baseContent.replace("🔥 BÁN & CHO THUÊ BẤT ĐỘNG SẢN CAO CẤP", "✨ [HÀNG ĐỘC QUYỀN] BẤT ĐỘNG SẢN CAO CẤP SIÊU ĐẸP"),
+        baseContent.replace("🔥 BÁN & CHO THUÊ BẤT ĐỘNG SẢN CAO CẤP", "🌟 GÓC CHÍNH CHỦ GỬI BÁN & CHO THUÊ ĐẲNG CẤP"),
+        baseContent.replace("🔥 BÁN & CHO THUÊ BẤT ĐỘNG SẢN CAO CẤP", "💎 CƠ HỘI ĐẦU TƯ / KINH DOANH VÀ AN CƯ TUYỆT VỜI"),
+        baseContent.replace("🔥 BÁN & CHO THUÊ BẤT ĐỘNG SẢN CAO CẤP", "🚀 GIỎ HÀNG HOT TỐT NHẤT THỊ TRƯỜNG - GỌI NGAY")
+      ];
+      return variations[index % variations.length];
+    }
+
+    // ĐĂNG HÀNG LOẠT NHIỀU FANPAGE
+    window.publishToMultiplePagesDirect = async () => {
+      const checkboxes = document.querySelectorAll('input[name="fbTargetDest"]:checked');
+      const baseMessage = document.getElementById('fbPostContent').value.trim();
+
+      if (checkboxes.length === 0) {
+        alert("⚠️ Anh vui lòng chọn ít nhất 1 Fanpage để đăng!");
+        return;
+      }
+
+      const selectedPageIds = Array.from(checkboxes).map(cb => cb.value);
+      const btn = document.getElementById('btnPublishFB');
+      btn.disabled = true;
+
+      let successCount = 0;
+      let failCount = 0;
+
+      try {
+        const images = currentPostApt.images || [];
+
+        for (let i = 0; i < selectedPageIds.length; i++) {
+          const pageId = selectedPageIds[i];
+          const targetPageObj = cachedPagesList.find(p => p.id === pageId);
+          if (!targetPageObj || !targetPageObj.access_token) {
+            failCount++;
+            continue;
+          }
+
+          const pageAccessToken = targetPageObj.access_token;
+          const pageName = targetPageObj.name;
+          btn.innerText = `⏳ Đang đăng trang ${i + 1}/${selectedPageIds.length} (${pageName})...`;
+
+          const spunMessage = generateSpunContent(baseMessage, i);
+          const attachedMedia = [];
+
+          if (images.length > 0) {
+            for (let imgUrl of images) {
+              try {
+                const photoRes = await fetch(`https://graph.facebook.com/v19.0/${pageId}/photos`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ url: imgUrl, published: false, access_token: pageAccessToken })
+                });
+                const photoData = await photoRes.json();
+                if (photoData.id) attachedMedia.push({ media_fbid: photoData.id });
+              } catch (e) {}
+            }
+          }
+
+          const postPayload = { message: spunMessage, access_token: pageAccessToken };
+          if (attachedMedia.length > 0) postPayload.attached_media = attachedMedia;
+
+          const postRes = await fetch(`https://graph.facebook.com/v19.0/${pageId}/feed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(postPayload)
+          });
+          const postData = await postRes.json();
+
+          if (postData.id) {
+            successCount++;
+          } else {
+            failCount++;
+          }
+
+          await new Promise(r => setTimeout(r, 1500));
+        }
+
+        alert(`🎉 HOÀN TẤT ĐĂNG HÀNG LOẠT!\n- Thành công: ${successCount} Fanpage\n- Thất bại: ${failCount} Fanpage`);
+        closeFBModal();
+
+      } catch (err) {
+        alert("❌ LỖI TRONG QUÁ TRÌNH ĐĂNG: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-brands fa-facebook-f mr-1.5"></i> 🚀 Đăng Hàng Loạt Các Fanpage Đã Chọn`;
+      }
+    };
+
+    function checkLeaseExpiryStatus(leaseEndDateStr) {
+      if (!leaseEndDateStr) return { isExpiringSoon: false, text: '' };
+      const today = new Date(); today.setHours(0,0,0,0);
+      const endDate = new Date(leaseEndDateStr); endDate.setHours(0,0,0,0);
+      const daysLeft = Math.ceil((endDate - today) / (1000 * 60 * 60 * 24));
+      if (daysLeft >= 0 && daysLeft <= 30) {
+        return { isExpiringSoon: true, text: `Sắp hết hạn HĐ thuê (còn ${daysLeft} ngày)` };
+      } else if (daysLeft < 0) {
+        return { isExpiringSoon: true, text: `HĐ thuê đã hết hạn (${Math.abs(daysLeft)} ngày trước)` };
+      }
+      return { isExpiringSoon: false, text: '' };
+    }
+
+    window.openEditModal = (id) => {
+      const apt = rawApartmentsData.find(a => a.id === id);
+      if (!apt) return;
+      editingApartmentId = id;
+      document.getElementById('modalTitle').innerText = "Chỉnh Sửa Thông Tin Bất Động Sản";
+      document.getElementById('projectName').value = apt.projectName || "Vinhomes Ba Son";
+      document.getElementById('transactionType').value = apt.transactionType || "Bán";
+      document.getElementById('status').value = apt.status || "Còn trống";
+      document.getElementById('codeNew').value = apt.codeNew || "";
+      document.getElementById('codeOld').value = apt.codeOld || "";
+      document.getElementById('unitType').value = apt.unitType || "Shophouse";
+      document.getElementById('priceSell').value = apt.priceSell || "";
+      document.getElementById('priceRent').value = apt.priceRent || "";
+      document.getElementById('area').value = apt.area || "";
+      document.getElementById('bedrooms').value = apt.bedrooms || 1;
+      document.getElementById('bathrooms').value = apt.bathrooms || 1;
+      document.getElementById('balconyDirection').value = apt.balconyDirection || "Đông Nam";
+      document.getElementById('leaseEndDate').value = apt.leaseEndDate || "";
+      document.getElementById('isHotDeal').checked = !!apt.isHotDeal;
+      document.getElementById('ownerName').value = apt.ownerName || "";
+      document.getElementById('ownerPhone').value = apt.ownerPhone || "";
+      document.getElementById('ownerEmail').value = apt.ownerEmail || "";
+      document.getElementById('notes').value = apt.notes || "";
+      selectedImageFiles = apt.images ? [...apt.images] : [];
+      renderImagePreviews();
+      openModal();
+    };
+
+    // LƯU CĂN HỘ KÈM KIỂM TRA TRÙNG MÃ
+    window.saveApartmentToFirebase = async (e) => {
+      e.preventDefault();
+      const codeNewInput = document.getElementById('codeNew').value.trim();
+      const normalizedNewCode = codeNewInput.toLowerCase();
+
+      const isDuplicate = rawApartmentsData.some(item => {
+        const itemCode = (item.codeNew || "").trim().toLowerCase();
+        if (editingApartmentId) {
+          return item.id !== editingApartmentId && itemCode === normalizedNewCode;
+        } else {
+          return itemCode === normalizedNewCode;
+        }
+      });
+
+      if (isDuplicate) {
+        alert(`⚠️ CẢNH BÁO TRÙNG MÃ!\nMã sản phẩm "${codeNewInput}" đã tồn tại trong hệ thống. Anh vui lòng kiểm tra lại để tránh nhập trùng kho!`);
+        document.getElementById('codeNew').focus();
+        return;
+      }
+
+      const saveBtn = document.getElementById('btnSubmitForm');
+      saveBtn.disabled = true;
+      const uploadedImageUrls = [];
+      try {
+        if (selectedImageFiles.length > 0) {
+          saveBtn.innerText = `⏳ Đang xử lý ${selectedImageFiles.length} ảnh lên Firebase Storage...`;
+          for (let i = 0; i < selectedImageFiles.length; i++) {
+            const url = await uploadSingleImageToFirebaseStorage(selectedImageFiles[i]);
+            uploadedImageUrls.push(url);
+          }
+        }
+        saveBtn.innerText = "⏳ Đang ghi dữ liệu...";
+        const aptData = {
+          codeNew: codeNewInput,
+          codeOld: document.getElementById('codeOld').value.trim(),
+          projectName: document.getElementById('projectName').value,
+          transactionType: document.getElementById('transactionType').value,
+          unitType: document.getElementById('unitType').value,
+          priceSell: document.getElementById('priceSell').value ? parseFloat(document.getElementById('priceSell').value) : null,
+          priceRent: document.getElementById('priceRent').value ? parseFloat(document.getElementById('priceRent').value) : null,
+          area: parseFloat(document.getElementById('area').value),
+          bedrooms: parseInt(document.getElementById('bedrooms').value),
+          bathrooms: parseInt(document.getElementById('bathrooms').value),
+          balconyDirection: document.getElementById('balconyDirection').value,
+          ownerName: document.getElementById('ownerName').value.trim(),
+          ownerPhone: document.getElementById('ownerPhone').value.trim(),
+          ownerEmail: document.getElementById('ownerEmail').value.trim(),
+          status: document.getElementById('status').value,
+          leaseEndDate: document.getElementById('leaseEndDate').value || '',
+          isHotDeal: document.getElementById('isHotDeal').checked,
+          notes: document.getElementById('notes').value.trim(),
+          images: uploadedImageUrls,
+          updatedAt: new Date().toISOString()
+        };
+        if (editingApartmentId) {
+          await updateDoc(doc(db, "apartments", editingApartmentId), aptData);
+          alert("✅ CẬP NHẬT THÀNH CÔNG!");
+        } else {
+          aptData.createdAt = new Date().toISOString();
+          await addDoc(collection(db, "apartments"), aptData);
+          alert("✅ ĐÃ THÊM MỚI THÀNH CÔNG!");
+        }
+        closeModal();
+        resetFormAndModal();
+      } catch (err) {
+        alert("❌ KHÔNG THỂ LƯU: " + err.message);
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = `<i class="fa-solid fa-cloud-arrow-up mr-1.5"></i> Lưu Thông Tin`;
+      }
+    };
+
+    window.resetFormAndModal = () => {
+      editingApartmentId = null;
+      document.getElementById('modalTitle').innerText = "Nhập Thông Tin Bất Động Sản Mới";
+      document.getElementById('aptForm').reset();
+      selectedImageFiles = [];
+      renderImagePreviews();
+    };
+
+    window.deleteApartmentFirebase = async (id) => {
+      if(confirm("Anh có chắc muốn xóa bất động sản này khỏi hệ thống?")) {
+        await deleteDoc(doc(db, "apartments", id));
+      }
+    };
+
+    function loadApartmentsRealtime() {
+      onSnapshot(collection(db, "apartments"), (snapshot) => {
+        rawApartmentsData = [];
+        snapshot.forEach(docSnap => {
+          rawApartmentsData.push({ id: docSnap.id, ...docSnap.data() });
+        });
+        updateExpiringCountBadge();
+        filterAndRenderApartments();
+      }, (error) => {
+        alert("Lỗi tải dữ liệu: " + error.message);
+      });
+    }
+
+    function updateExpiringCountBadge() {
+      let expiringCount = 0;
+      rawApartmentsData.forEach(item => {
+        if (item.status === 'Đã cho thuê' && item.leaseEndDate) {
+          if (checkLeaseExpiryStatus(item.leaseEndDate).isExpiringSoon) expiringCount++;
+        }
+      });
+      const badge = document.getElementById('expiringCountBadge');
+      if (expiringCount > 0) {
+        badge.innerText = `⚠️ Có ${expiringCount} sản phẩm cho thuê sắp/đã hết hạn HĐ (Cần nhắc lại)`;
+        badge.classList.remove('hidden');
+      } else {
+        badge.classList.add('hidden');
+      }
+    }
+
+    window.filterAndRenderApartments = () => {
+      const searchKeyword = document.getElementById('searchInput').value.toLowerCase().trim();
+      const filterProject = document.getElementById('filterProject').value;
+      const filterTransaction = document.getElementById('filterTransaction').value;
+      const filterType = document.getElementById('filterType').value;
+      const filterBathrooms = document.getElementById('filterBathrooms').value;
+      const filterStatus = document.getElementById('filterStatus').value;
+      const filterHot = document.getElementById('filterHot').value;
+      const filterExpiring = document.getElementById('filterExpiring').value;
+      const minSell = parseFloat(document.getElementById('minSell').value) || 0;
+      const maxSell = parseFloat(document.getElementById('maxSell').value) || Infinity;
+      const minRent = parseFloat(document.getElementById('minRent').value) || 0;
+      const maxRent = parseFloat(document.getElementById('maxRent').value) || Infinity;
+
+      const filtered = rawApartmentsData.filter(item => {
+        const matchSearch = !searchKeyword || 
+          (item.codeNew && item.codeNew.toLowerCase().includes(searchKeyword)) ||
+          (item.codeOld && item.codeOld.toLowerCase().includes(searchKeyword)) ||
+          (item.ownerName && item.ownerName.toLowerCase().includes(searchKeyword)) ||
+          (item.ownerPhone && item.ownerPhone.includes(searchKeyword)) ||
+          (item.notes && item.notes.toLowerCase().includes(searchKeyword));
+        const matchProject = !filterProject || item.projectName === filterProject;
+        const matchTransaction = !filterTransaction || item.transactionType === filterTransaction;
+        const matchType = !filterType || item.unitType === filterType;
+        const matchBathrooms = !filterBathrooms || item.bathrooms == filterBathrooms;
+        const matchStatus = !filterStatus || item.status === filterStatus;
+        const matchHot = !filterHot || (filterHot === 'yes' ? item.isHotDeal === true : item.isHotDeal !== true);
+        let matchExpiring = true;
+        if (filterExpiring === 'yes') {
+          matchExpiring = (item.status === 'Đã cho thuê' && item.leaseEndDate && checkLeaseExpiryStatus(item.leaseEndDate).isExpiringSoon);
+        }
+        const itemSell = item.priceSell || 0;
+        const matchSellPrice = (minSell === 0 && maxSell === Infinity) || (itemSell >= minSell && itemSell <= maxSell);
+        const itemRent = item.priceRent || 0;
+        const matchRentPrice = (minRent === 0 && maxRent === Infinity) || (itemRent >= minRent && itemRent <= maxRent);
+        return matchSearch && matchProject && matchTransaction && matchType && matchBathrooms && matchStatus && matchHot && matchExpiring && matchSellPrice && matchRentPrice;
+      });
+      renderGrid(filtered);
+    };
+
+    window.resetFilters = () => {
+      document.getElementById('searchInput').value = "";
+      document.getElementById('filterProject').value = "";
+      document.getElementById('filterTransaction').value = "";
+      document.getElementById('filterType').value = "";
+      document.getElementById('filterBathrooms').value = "";
+      document.getElementById('filterStatus').value = "";
+      document.getElementById('filterHot').value = "";
+      document.getElementById('filterExpiring').value = "";
+      document.getElementById('minSell').value = "";
+      document.getElementById('maxSell').value = "";
+      document.getElementById('minRent').value = "";
+      document.getElementById('maxRent').value = "";
+      filterAndRenderApartments();
+    };
+
+    let currentGalleryImages = [];
+    let currentGalleryIndex = 0;
+    let currentGalleryAptId = null;
+
+    window.openGallery = (id) => {
+      const apt = rawApartmentsData.find(a => a.id === id);
+      if (!apt || !apt.images || apt.images.length === 0) return;
+      currentGalleryImages = apt.images;
+      currentGalleryIndex = 0;
+      currentGalleryAptId = id;
+      updateGalleryView();
+      document.getElementById('galleryModal').classList.remove('hidden');
+    };
+
+    window.closeGallery = () => { document.getElementById('galleryModal').classList.add('hidden'); };
+    window.prevGalleryImage = () => {
+      if (currentGalleryIndex > 0) currentGalleryIndex--; else currentGalleryIndex = currentGalleryImages.length - 1;
+      updateGalleryView();
+    };
+    window.nextGalleryImage = () => {
+      if (currentGalleryIndex < currentGalleryImages.length - 1) currentGalleryIndex++; else currentGalleryIndex = 0;
+      updateGalleryView();
+    };
+    function updateGalleryView() {
+      document.getElementById('galleryImg').src = currentGalleryImages[currentGalleryIndex];
+      document.getElementById('galleryCounter').innerText = `Ảnh ${currentGalleryIndex + 1} / ${currentGalleryImages.length}`;
+    }
+
+    function renderGrid(dataList) {
+      const grid = document.getElementById("apartmentGrid");
+      grid.innerHTML = "";
+      if(dataList.length === 0) {
+        grid.innerHTML = `<div class="col-span-full text-center py-16 text-slate-400 font-medium">Chưa có sản phẩm nào hoặc không tìm thấy kết quả phù hợp.</div>`;
+        return;
+      }
+
+      dataList.forEach(item => {
+        const id = item.id;
+        let priceTag = "";
+        if (item.priceSell) priceTag += `<span class="text-rose-600 font-extrabold text-xl mr-2">${item.priceSell} Tỷ</span> `;
+        if (item.priceRent) priceTag += `<span class="text-indigo-600 font-extrabold text-xl">${item.priceRent} Tr/th</span>`;
+
+        let leaseAlertBadge = "";
+        if (item.status === 'Đã cho thuê' && item.leaseEndDate) {
+          const expStatus = checkLeaseExpiryStatus(item.leaseEndDate);
+          if (expStatus.isExpiringSoon) {
+            leaseAlertBadge = `<div class="mt-2.5 p-2 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-2 text-xs text-amber-800 font-bold animate-pulse"><i class="fa-solid fa-clock-rotate-left text-amber-600 text-sm"></i><span>${expStatus.text} (${item.leaseEndDate})</span></div>`;
+          } else {
+            leaseAlertBadge = `<div class="mt-2 text-[11px] text-slate-500 font-medium"><i class="fa-regular fa-calendar-check text-slate-400 mr-1"></i>Hạn HĐ thuê đến: <b>${item.leaseEndDate}</b></div>`;
+          }
+        }
+
+        let imgHTML = item.images && item.images.length > 0 ? 
+          `<div onclick="openGallery('${id}')" class="relative w-full h-48 bg-slate-900 overflow-hidden cursor-pointer group">
+            <img src="${item.images[0]}" class="w-full h-full object-cover group-hover:scale-105 transition duration-300">
+            ${item.isHotDeal ? `<span class="absolute top-2 left-2 bg-rose-600 text-white font-bold text-[11px] px-2.5 py-1 rounded-lg shadow-lg uppercase tracking-wider"><i class="fa-solid fa-fire mr-1"></i> HOT DEAL</span>` : ''}
+            <span class="absolute bottom-2 right-2 bg-slate-900/80 text-white text-xs font-semibold px-2.5 py-1 rounded-lg flex items-center gap-1 shadow"><i class="fa-solid fa-images text-amber-400"></i> Xem ${item.images.length} ảnh</span>
+          </div>` :
+          `<div class="relative w-full h-36 bg-slate-100 flex items-center justify-center text-slate-400 text-xs"><i class="fa-regular fa-image text-2xl mr-2"></i> Chưa có album ảnh</div>`;
+
+        let phoneHtml = "";
+        if (item.ownerPhone) {
+          const phoneNumbers = item.ownerPhone.split(/[,;]+/);
+          phoneHtml = phoneNumbers.map(p => {
+            const cleanPhone = p.trim();
+            if (!cleanPhone) return "";
+            return `<a href="tel:${cleanPhone}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold px-2 py-0.5 rounded-lg border border-indigo-200 mr-1.5 my-0.5"><i class="fa-solid fa-phone text-[10px]"></i> ${cleanPhone}</a>`;
+          }).join('');
+        }
+
+        const cardHTML = `
+          <div class="bg-white rounded-2xl overflow-hidden border border-slate-200/80 shadow-sm hover:shadow-md transition flex flex-col justify-between">
+            <div>
+              ${imgHTML}
+              <div class="p-4">
+                <div class="flex justify-between items-start border-b border-slate-100 pb-2.5 mb-3">
+                  <div>
+                    <h3 class="font-bold text-slate-900 text-xl leading-tight">${item.codeNew} ${item.codeOld ? `<span class="text-xs text-slate-400 font-normal">(${item.codeOld})</span>` : ''}</h3>
+                    <span class="text-xs text-amber-600 font-bold uppercase tracking-wide">${item.projectName}</span>
+                  </div>
+                  <div class="flex flex-col items-end gap-1">
+                    <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800">${item.transactionType || 'Bán'}</span>
+                    <span class="px-2.5 py-1 rounded-lg text-xs font-bold ${item.status === 'Còn trống' ? 'bg-emerald-100 text-emerald-800' : 'bg-indigo-100 text-indigo-800'}">${item.status}</span>
+                  </div>
+                </div>
+                <div class="flex justify-between items-center my-2">
+                  <div>${priceTag}</div>
+                  <p class="text-xs font-bold text-slate-700 bg-slate-100 px-2.5 py-1 rounded-lg">${item.area} m² | ${item.unitType || 'Căn hộ'} | ${item.bathrooms || 1} WC</p>
+                </div>
+                ${leaseAlertBadge}
+                ${item.notes ? `<div class="text-xs text-slate-600 my-2.5 bg-amber-50/80 p-2.5 rounded-xl border border-amber-200/60 leading-relaxed"><i class="fa-solid fa-quote-left text-amber-500 mr-1.5"></i><b>Ghi chú:</b> ${item.notes}</div>` : ''}
+                
+                <div class="space-y-1 text-xs text-slate-700 bg-slate-50 p-3 rounded-xl mt-3 border border-slate-100">
+                  <p><b>Chủ nhà:</b> ${item.ownerName}</p>
+                  <div class="pt-1 flex flex-wrap items-center">
+                    <b class="mr-1">SĐT:</b> ${phoneHtml || '<span class="text-slate-400">Không có</span>'}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="px-4 pb-3 pt-2 border-t border-slate-100 flex justify-between items-center bg-slate-50/50 gap-1.5">
+              ${item.images && item.images.length > 0 ? `<button onclick="downloadAllImagesDirect('${id}')" class="text-xs text-slate-700 hover:text-amber-600 px-2 py-1.5 rounded-lg font-bold transition flex items-center gap-1 border border-slate-200 bg-white"><i class="fa-solid fa-download text-amber-500"></i> Tải Ảnh</button>` : '<span></span>'}
+              <div class="flex items-center gap-1">
+                <button onclick="generateAIPost('${id}')" class="text-xs text-blue-700 hover:bg-blue-100 px-2.5 py-1.5 rounded-lg font-bold transition flex items-center gap-1 bg-blue-50 border border-blue-200"><i class="fa-brands fa-facebook-f text-blue-600"></i> Đăng FB</button>
+                <button onclick="openEditModal('${id}')" class="text-xs text-indigo-600 hover:bg-indigo-100 px-2.5 py-1.5 rounded-lg font-bold transition flex items-center gap-1 bg-indigo-50 border border-indigo-100"><i class="fa-solid fa-pen-to-square"></i> Sửa</button>
+                <button onclick="deleteApartmentFirebase('${id}')" class="text-xs text-rose-600 hover:bg-rose-100 px-2.5 py-1.5 rounded-semibold transition"><i class="fa-solid fa-trash"></i></button>
+              </div>
+            </div>
+          </div>
+        `;
+        grid.innerHTML += cardHTML;
+      });
+    }
+  </script>
+</head>
+<body class="bg-slate-100 min-h-screen text-slate-800 font-sans">
+
+  <!-- ĐĂNG NHẬP -->
+  <div id="loginSection" class="flex items-center justify-center min-h-screen p-4">
+    <div class="bg-white p-6 sm:p-8 rounded-2xl shadow-xl max-w-sm w-full space-y-5 border border-slate-100">
+      <div class="text-center">
+        <div class="bg-amber-500 text-slate-900 w-12 h-12 rounded-2xl flex items-center justify-center mx-auto mb-3 shadow-md"><i class="fa-solid fa-city text-xl"></i></div>
+        <h2 class="text-xl font-bold text-slate-900">ONE CENTER LAND</h2>
+        <p class="text-xs text-slate-400 mt-1">Hệ thống Quản lý Bất Động Sản</p>
+      </div>
+      <form onsubmit="handleLogin(event)" class="space-y-3">
+        <div><label class="block text-xs font-semibold text-slate-600 mb-1">Email Tài Khoản</label><input type="email" id="loginEmail" required class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-amber-500 focus:outline-none"></div>
+        <div><label class="block text-xs font-semibold text-slate-600 mb-1">Mật Khẩu</label><input type="password" id="loginPass" required class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-amber-500 focus:outline-none"></div>
+        <button type="submit" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl text-sm shadow-md transition">Đăng Nhập System</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- MAIN APP -->
+  <div id="appSection" class="hidden">
+    <header class="bg-slate-900 text-white shadow-lg sticky top-0 z-30">
+      <div class="max-w-7xl mx-auto px-4 py-3.5 flex justify-between items-center">
+        <div class="flex items-center space-x-3">
+          <div class="bg-amber-500 p-2 rounded-xl text-slate-900"><i class="fa-solid fa-city text-lg"></i></div>
+          <div>
+            <h1 class="font-bold text-base sm:text-lg leading-tight">QUẢN LÝ BẤT ĐỘNG SẢN</h1>
+            <span id="userEmailDisplay" class="text-xs text-amber-400 font-medium block"></span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="resetFormAndModal(); openModal();" class="bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold px-4 py-2.5 rounded-xl text-xs sm:text-sm shadow flex items-center gap-1.5 transition"><i class="fa-solid fa-plus text-sm"></i> Thêm Sản Phẩm Mới</button>
+          <button onclick="handleLogout()" class="bg-slate-800 text-slate-300 hover:text-white px-3 py-2.5 rounded-xl text-xs border border-slate-700"><i class="fa-solid fa-right-from-bracket"></i></button>
+        </div>
+      </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto p-4 sm:p-6 space-y-4">
+      <div id="expiringCountBadge" class="hidden p-3 bg-amber-50 border border-amber-300 text-amber-900 font-bold text-xs rounded-2xl shadow-sm text-center"></div>
+
+      <!-- THANH TÌM KIẾM & BỘ LỌC ĐẦY ĐỦ -->
+      <div class="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200/80 shadow-sm space-y-3">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+          <div class="relative">
+            <i class="fa-solid fa-magnifying-glass absolute left-3 top-3 text-slate-400 text-xs"></i>
+            <input type="text" id="searchInput" oninput="filterAndRenderApartments()" placeholder="Tìm mã căn, Shophouse, chủ nhà, SĐT..." class="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:ring-2 focus:ring-amber-500 focus:outline-none">
+          </div>
+          <select id="filterProject" onchange="filterAndRenderApartments()" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium">
+            <option value="">Tất cả Dự Án</option>
+            <option value="Vinhomes Ba Son">Vinhomes Ba Son</option>
+            <option value="Empire City">Empire City</option>
+            <option value="Metropole">Metropole</option>
+            <option value="Grand Marina">Grand Marina</option>
+            <option value="The Global City">The Global City</option>
+          </select>
+          <select id="filterTransaction" onchange="filterAndRenderApartments()" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-blue-700">
+            <option value="">Tất cả Nhu Cầu (Bán / Thuê)</option>
+            <option value="Bán">Chỉ xem Bán</option>
+            <option value="Cho thuê">Chỉ xem Cho thuê</option>
+            <option value="Bán & Cho thuê">Bán & Cho thuê</option>
+          </select>
+          <select id="filterHot" onchange="filterAndRenderApartments()" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-rose-600">
+            <option value="">Tất cả Sản Phẩm (Thường & Hot)</option>
+            <option value="yes">🔥 Chỉ xem CĂN / SHOPHOUSE HOT</option>
+          </select>
+          <select id="filterExpiring" onchange="filterAndRenderApartments()" class="w-full p-2 bg-amber-50 border border-amber-200 rounded-xl text-xs font-bold text-amber-800">
+            <option value="">Tất cả Hạn Hợp Đồng</option>
+            <option value="yes">⏰ Sản phẩm thuê SẮP / ĐÃ HẾT HẠN HĐ (Trong 30 ngày)</option>
+          </select>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 pt-2 border-t border-slate-100">
+          <div><input type="number" id="minSell" oninput="filterAndRenderApartments()" placeholder="Giá Bán Từ (Tỷ)" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><input type="number" id="maxSell" oninput="filterAndRenderApartments()" placeholder="Đến Giá Bán (Tỷ)" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><input type="number" id="minRent" oninput="filterAndRenderApartments()" placeholder="Giá Thuê Từ (Tr)" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><input type="number" id="maxRent" oninput="filterAndRenderApartments()" placeholder="Đến Giá Thuê (Tr)" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <select id="filterType" onchange="filterAndRenderApartments()" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium">
+            <option value="">Tất cả Loại Hình</option>
+            <option value="Shophouse">Shophouse</option><option value="1PN">1PN</option><option value="2PN">2PN</option><option value="3PN">3PN</option><option value="4PN">4PN</option><option value="Duplex">Duplex</option><option value="Penthouse">Penthouse</option>
+          </select>
+          <select id="filterBathrooms" onchange="filterAndRenderApartments()" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium">
+            <option value="">Số WC (Tất cả)</option>
+            <option value="1">1 WC</option><option value="2">2 WC</option><option value="3">3 WC</option><option value="4">4 WC</option>
+          </select>
+          <div class="flex gap-2">
+            <select id="filterStatus" onchange="filterAndRenderApartments()" class="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium">
+              <option value="">Trạng Thái (Tất cả)</option>
+              <option value="Còn trống">Còn trống</option><option value="Đã cho thuê">Đã cho thuê</option><option value="Đã bán">Đã bán</option>
+            </select>
+            <button onclick="resetFilters()" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-xs font-bold whitespace-nowrap" title="Xóa bộ lọc"><i class="fa-solid fa-rotate-right"></i></button>
+          </div>
+        </div>
+      </div>
+
+      <div id="apartmentGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5"></div>
+    </main>
+  </div>
+
+  <!-- MODAL 🤖 AI VIẾT BÀI & CHỌN NHIỀU FANPAGE ĐĂNG HÀNG LOẠT -->
+  <div id="fbModal" class="fixed inset-0 bg-slate-900/80 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-6 hidden">
+    <div class="bg-white rounded-3xl max-w-2xl w-full max-h-[92vh] overflow-y-auto shadow-2xl border border-slate-100 flex flex-col">
+      <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-white sticky top-0 z-10">
+        <div class="flex items-center gap-2">
+          <i class="fa-brands fa-facebook text-blue-600 text-2xl"></i>
+          <div>
+            <h3 class="font-bold text-slate-900 text-base">Đăng Hàng Loạt Lên Nhiều Fanpage Cùng Lúc</h3>
+            <p class="text-xs text-slate-400">Tích chọn các trang muốn đăng và tự động xử lý Page Token chuẩn xác</p>
+          </div>
+        </div>
+        <button onclick="closeFBModal()" class="text-slate-400 hover:text-slate-600 p-2 rounded-full hover:bg-slate-100"><i class="fa-solid fa-xmark text-xl"></i></button>
+      </div>
+
+      <div class="p-6 space-y-4">
+        <!-- CHỌN NHIỀU FANPAGE (CHECKBOX) -->
+        <div class="bg-blue-50/60 p-4 rounded-2xl border border-blue-200 space-y-3">
+          <div class="flex justify-between items-center">
+            <label class="text-xs font-bold text-blue-900 uppercase tracking-wider"><i class="fa-solid fa-square-check text-blue-600 mr-1"></i>Tích chọn các Fanpage muốn đăng:</label>
+            <button onclick="fetchRealFacebookDestinations(document.getElementById('fbAccessToken').value.trim())" class="text-[11px] bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded-lg font-bold transition shadow-sm"><i class="fa-solid fa-rotate mr-1"></i> Quét lại danh sách</button>
+          </div>
+          
+          <div id="fbDestinationsContainer" class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto p-1 bg-white border border-blue-100 rounded-xl">
+            <p class="text-xs text-slate-400 p-3 italic">Đang tải danh sách trang...</p>
+          </div>
+          
+          <div class="pt-2 border-t border-blue-200/60">
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-semibold text-slate-600">Facebook User Access Token:</span>
+              <button onclick="saveFBCredentials()" class="text-[10px] bg-blue-600 text-white px-2.5 py-1 rounded font-bold">Lưu Token & Quét</button>
+            </div>
+            <input type="password" id="fbAccessToken" placeholder="Dán mã Token Facebook của anh vào đây..." class="w-full p-2 bg-white border border-slate-200 rounded-xl text-xs font-mono">
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs font-bold text-slate-700 mb-1">Nội dung bài viết (AI sẽ tự động biến tấu câu chữ cho từng trang):</label>
+          <textarea id="fbPostContent" rows="8" class="w-full p-3 bg-slate-50 border border-slate-200 rounded-2xl text-xs leading-relaxed font-sans focus:ring-2 focus:ring-blue-500 focus:outline-none"></textarea>
+        </div>
+
+        <div class="pt-2 flex justify-end gap-3 border-t border-slate-100">
+          <button type="button" onclick="closeFBModal()" class="px-4 py-2.5 border border-slate-200 rounded-xl text-xs font-semibold text-slate-600 hover:bg-slate-50">Đóng</button>
+          <button type="button" id="btnPublishFB" onclick="publishToMultiplePagesDirect()" class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs shadow-md transition flex items-center gap-1.5">
+            <i class="fa-brands fa-facebook-f"></i> 🚀 Đăng Hàng Loạt Các Fanpage Đã Chọn
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL XEM ALBUM ẢNH PHÓNG TO -->
+  <div id="galleryModal" class="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4 hidden">
+    <div class="absolute top-4 right-4 flex items-center gap-2 z-10">
+      <button onclick="copyCurrentImageLink()" class="bg-indigo-600 text-white font-bold text-xs px-3 py-2 rounded-xl shadow flex items-center gap-1.5"><i class="fa-regular fa-copy"></i> Copy Link Zalo</button>
+      <button onclick="downloadAllImagesDirect(currentGalleryAptId)" class="bg-amber-500 text-slate-900 font-bold text-xs px-3 py-2 rounded-xl shadow flex items-center gap-1.5"><i class="fa-solid fa-download"></i> Tải Cả Album Ảnh</button>
+      <button onclick="closeGallery()" class="text-white text-2xl p-2 ml-2"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <button onclick="prevGalleryImage()" class="absolute left-4 text-white text-3xl p-3 bg-black/50 rounded-full z-10"><i class="fa-solid fa-chevron-left"></i></button>
+    <div class="max-w-4xl max-h-[85vh] flex flex-col items-center">
+      <img id="galleryImg" class="max-w-full max-h-[80vh] object-contain rounded-lg">
+      <span id="galleryCounter" class="text-white text-xs font-bold mt-3 bg-slate-800/80 px-3 py-1 rounded-full"></span>
+    </div>
+    <button onclick="nextGalleryImage()" class="absolute right-4 text-white text-3xl p-3 bg-black/50 rounded-full z-10"><i class="fa-solid fa-chevron-right"></i></button>
+  </div>
+
+  <!-- MODAL THÊM / SỬA -->
+  <div id="aptModal" class="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-6 hidden">
+    <div class="bg-white rounded-3xl max-w-4xl w-full max-h-[92vh] overflow-y-auto shadow-2xl border border-slate-100 flex flex-col">
+      <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center sticky top-0 bg-white/95 backdrop-blur z-10">
+        <div>
+          <h3 id="modalTitle" class="font-bold text-slate-900 text-lg">Nhập Thông Tin Bất Động Sản Mới</h3>
+          <p class="text-xs text-slate-400">Điền thông số chi tiết và tải lên bộ sưu tập ảnh (Lưu trực tiếp Firebase Storage)</p>
+        </div>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600 p-2 rounded-full hover:bg-slate-100"><i class="fa-solid fa-xmark text-xl"></i></button>
+      </div>
+      <form id="aptForm" onsubmit="saveApartmentToFirebase(event)" class="p-6 space-y-6">
+        <div class="bg-slate-50/80 p-4 rounded-2xl border border-slate-200/60 space-y-3">
+          <label class="block text-xs font-bold text-slate-700 uppercase tracking-wider"><i class="fa-solid fa-images text-amber-500 mr-1.5"></i>Bộ Sưu Tập Hình Ảnh (Lưu Vĩnh Viễn Trên Google Storage)</label>
+          <div id="dropZone" onclick="document.getElementById('fileInput').click()" class="border-2 border-dashed border-slate-300 bg-white rounded-xl p-5 text-center cursor-pointer hover:border-amber-500 transition">
+            <input type="file" id="fileInput" accept="image/*" multiple class="hidden" onchange="handleMultipleImages(this.files)">
+            <i class="fa-solid fa-cloud-arrow-up text-3xl text-amber-500 mb-2"></i>
+            <p class="text-xs font-semibold text-slate-700">Bấm để chọn nhiều ảnh hoặc kéo thả cả album ảnh vào đây</p>
+          </div>
+          <div id="previewContainer" class="hidden space-y-2 pt-2">
+            <p class="text-xs font-semibold text-slate-600">Ảnh đã chọn xem trước:</p>
+            <div id="imagePreviewGrid" class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-5 gap-3"></div>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Dự Án *</label><select id="projectName" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium"><option value="Vinhomes Ba Son">Vinhomes Ba Son</option><option value="Empire City">Empire City</option><option value="Metropole">Metropole</option><option value="Grand Marina">Grand Marina</option><option value="The Global City">The Global City</option></select></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Nhu Cầu *</label><select id="transactionType" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium"><option value="Bán">Bán</option><option value="Cho thuê">Cho thuê</option><option value="Bán & Cho thuê">Bán & Cho thuê</option></select></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Trạng Thái *</label><select id="status" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium"><option value="Còn trống">Còn trống</option><option value="Đã cho thuê">Đã cho thuê</option><option value="Đã bán">Đã bán</option></select></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Mã Sản Phẩm / Căn *</label><input type="text" id="codeNew" required placeholder="Aqua1-0812 hoặc Shop-05" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Mã Cũ / Block</label><input type="text" id="codeOld" placeholder="A1.08.12" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Loại Hình *</label><select id="unitType" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium"><option value="Shophouse">Shophouse</option><option value="1PN">1PN</option><option value="2PN">2PN</option><option value="3PN">3PN</option><option value="4PN">4PN</option><option value="Duplex">Duplex</option><option value="Penthouse">Penthouse</option></select></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Giá Bán (Tỷ)</label><input type="number" step="0.01" id="priceSell" placeholder="11.5" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-rose-600"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Giá Thuê (Tr/th)</label><input type="number" step="1" id="priceRent" placeholder="35" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-indigo-600"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Diện Tích (m²) *</label><input type="number" step="0.1" id="area" required placeholder="120.5" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Số PN</label><input type="number" id="bedrooms" value="1" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Số WC *</label><input type="number" id="bathrooms" value="1" required class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Hướng Ban Công / Cửa</label><select id="balconyDirection" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"><option value="Đông Nam">Đông Nam</option><option value="Tây Nam">Tây Nam</option><option value="Đông Bắc">Đông Bắc</option><option value="Tây Bắc">Tây Bắc</option><option value="Chính Nam">Chính Nam</option></select></div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div class="p-3 bg-amber-50 border border-amber-200 rounded-2xl">
+            <label class="block text-xs font-bold text-amber-900 mb-1">Ngày Hết Hạn Hợp Đồng Thuê:</label>
+            <input type="date" id="leaseEndDate" class="w-full p-2 bg-white border border-amber-300 rounded-xl text-xs font-medium">
+          </div>
+          <div class="p-3 bg-rose-50 border border-rose-100 rounded-2xl flex items-center gap-3">
+            <input type="checkbox" id="isHotDeal" class="w-4 h-4 text-rose-600 rounded">
+            <label for="isHotDeal" class="text-xs font-bold text-rose-700 cursor-pointer">Đánh dấu đây là sản phẩm HOT DEAL 🔥</label>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-slate-100">
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Tên Chủ Nhà *</label><input type="text" id="ownerName" required placeholder="ANH HÀ" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">SĐT Chủ Nhà *</label><input type="tel" id="ownerPhone" required placeholder="0979669663" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-indigo-600"></div>
+          <div><label class="block text-xs font-semibold text-slate-600 mb-1">Email Chủ Nhà</label><input type="email" id="ownerEmail" placeholder="chunha@gmail.com" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></div>
+        </div>
+        <div><label class="block text-xs font-semibold text-slate-600 mb-1">Ghi Chú Đặc Điểm (Mặt tiền, kinh doanh...)</label><textarea id="notes" rows="3" placeholder="Shophouse mặt tiền đường lớn, kinh doanh sầm uất..." class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"></textarea></div>
+        <div class="pt-3 flex justify-end gap-3 border-t border-slate-100">
+          <button type="button" onclick="closeModal()" class="px-5 py-2.5 border border-slate-200 rounded-xl text-xs font-semibold text-slate-600">Hủy</button>
+          <button type="submit" id="btnSubmitForm" class="px-6 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl text-xs shadow-md">Lưu Thông Tin</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    function openModal() { document.getElementById('aptModal').classList.remove('hidden'); }
+    function closeModal() { document.getElementById('aptModal').classList.add('hidden'); }
+    const dropZone = document.getElementById('dropZone');
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); ev.stopPropagation(); }, false));
+    dropZone.addEventListener('drop', e => { if (e.dataTransfer.files.length) handleMultipleImages(e.dataTransfer.files); });
+  </script>
+</body>
+</html>
